@@ -1,0 +1,63 @@
+{
+  "datacenter": "us-east-1a",
+  "environment": "production",
+  "servers": [
+    {
+      "hostname": "worker-node-01",
+      "os": "Ubuntu 22.04",
+      "status": "online",
+      "docker": {
+        "version": "27.0",
+        "containers": [
+          {
+            "name": "nginx",
+            "status": "running"
+          },
+          {
+            "name": "redis",
+            "status": "running"
+          }
+        ]
+      }
+    }
+  ],
+  "kubernetes": {
+    "cluster": "prod-cluster",
+    "version": "1.29",
+    "nodes": [
+      {
+        "name": "node-1",
+        "status": "Ready"
+      }
+    ],
+    "namespaces": [
+      {
+        "name": "default",
+        "deployments": [
+          {
+            "name": "frontend",
+            "replicas": 2,
+            "pods": [
+              {
+                "name": "frontend-6b9f8c-p9j2m",
+                "status": "Running",
+                "restarts": 0
+              },
+              {
+                "name": "frontend-6b9f8c-x2k4p",
+                "status": "Running",
+                "restarts": 0
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "services": [
+      {
+        "name": "frontend-svc",
+        "type": "LoadBalancer"
+      }
+    ]
+  }
+}

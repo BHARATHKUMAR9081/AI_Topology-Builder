@@ -1,0 +1,92 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    font-family: 'Space Grotesk', system-ui, -apple-system, sans-serif;
+    color-scheme: light;
+  }
+}
+
+/* Custom Keyframe Animations */
+@keyframes dash {
+  from {
+    stroke-dashoffset: 24;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes node-entrance {
+  0% {
+    opacity: 0;
+    transform: scale(0.6) translateY(10px);
+    box-shadow: 0 0 0 rgba(249, 115, 22, 0);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.1) translateY(-2px);
+    box-shadow: 0 0 25px rgba(249, 115, 22, 0.6);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  }
+}
+
+@keyframes node-update {
+  0% {
+    box-shadow: 0 0 0 rgba(14, 165, 233, 0);
+  }
+  50% {
+    box-shadow: 0 0 25px rgba(14, 165, 233, 0.7);
+    border-color: #0ea5e9;
+  }
+  100% {
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  }
+}
+
+.animate-node-entrance {
+  animation: node-entrance 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-node-update {
+  animation: node-update 0.8s ease-in-out forwards;
+}
+
+/* Custom Light Scrollbars */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: #f8fafc;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* ReactFlow light theme overrides */
+.react-flow__attribution {
+  display: none !important;
+}
+
+.react-flow__controls-button {
+  background: #ffffff !important;
+  border-color: #e2e8f0 !important;
+  fill: #475569 !important;
+}
+
+.react-flow__controls-button:hover {
+  background: #f1f5f9 !important;
+  fill: #0ea5e9 !important;
+}
