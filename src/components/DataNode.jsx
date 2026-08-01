@@ -3,8 +3,23 @@ import { Handle, Position } from '@xyflow/react';
 import { resolveIcon } from '../lib/icons';
 
 export const DataNode = memo(({ data }) => {
-  const { key, kind, isNew, justUpdated, isRemoving } = data;
+  const { key, kind, depth = 1, isNew, justUpdated, isRemoving } = data;
   const IconComponent = resolveIcon(key, kind);
+
+  // Dynamic Level-Based Sizing: Size decreases proportionally as radial level depth increases
+  let logoSize = 'w-20 h-20'; // Level 1 (80px x 80px)
+  let textStyle = 'text-base font-extrabold px-5 py-1.5 max-w-[230px]';
+
+  if (depth === 2) {
+    logoSize = 'w-16 h-16'; // Level 2 (64px x 64px)
+    textStyle = 'text-sm font-bold px-4 py-1 max-w-[190px]';
+  } else if (depth === 3) {
+    logoSize = 'w-12 h-12'; // Level 3 (48px x 48px)
+    textStyle = 'text-xs font-bold px-3 py-1 max-w-[160px]';
+  } else if (depth >= 4) {
+    logoSize = 'w-10 h-10'; // Level 4+ (40px x 40px)
+    textStyle = 'text-[11px] font-semibold px-2.5 py-0.5 max-w-[140px]';
+  }
 
   // Smooth hover and state animations
   let animClass = 'transition-all duration-300 ease-out transform-gpu';
@@ -24,17 +39,17 @@ export const DataNode = memo(({ data }) => {
       <Handle
         type="target"
         position={Position.Top}
-        className="!bg-sky-500 !w-3.5 !h-3.5 !border-2 !border-white shadow-md"
+        className="!bg-sky-500 !w-3 !h-3 !border-2 !border-white shadow-md"
       />
 
-      {/* Prominent Floating Brand Logo Icon (80px x 80px) */}
-      <div className={`relative flex items-center justify-center p-1.5 ${animClass}`}>
-        <IconComponent className="w-20 h-20 drop-shadow-xl" />
+      {/* Floating Brand Logo Icon (Size scaled by radial depth level) */}
+      <div className={`relative flex items-center justify-center p-1 ${animClass}`}>
+        <IconComponent className={`${logoSize} drop-shadow-xl`} />
       </div>
 
-      {/* Prominent, Ultra-Legible Text Label Pill (16px bold) */}
-      <div className="mt-2 px-5 py-1.5 rounded-full bg-slate-900 border-2 border-slate-800 shadow-2xl text-center max-w-[230px] truncate">
-        <span className="font-sans font-extrabold text-base text-white tracking-wide truncate block drop-shadow-md">
+      {/* Text Label Pill (Typography scaled by radial depth level) */}
+      <div className={`mt-1.5 rounded-full bg-slate-900 border-2 border-slate-800 shadow-2xl text-center truncate ${textStyle}`}>
+        <span className="font-sans text-white tracking-wide truncate block drop-shadow-md">
           {key}
         </span>
       </div>
@@ -43,7 +58,7 @@ export const DataNode = memo(({ data }) => {
       <Handle
         type="source"
         position={Position.Bottom}
-        className="!bg-sky-500 !w-3.5 !h-3.5 !border-2 !border-white shadow-md"
+        className="!bg-sky-500 !w-3 !h-3 !border-2 !border-white shadow-md"
       />
     </div>
   );

@@ -1,6 +1,6 @@
 /**
  * Radial Layout Math Engine
- * Computes concentric radial ring positions with optimal ring spacing.
+ * Computes concentric radial ring positions with generous spacing matching the visual design.
  */
 
 export function computeRadialLayout(nodes) {
@@ -39,18 +39,22 @@ export function computeRadialLayout(nodes) {
   rootIds.forEach(id => countLeaves(id));
 
   const positions = new Map();
-  // Slightly decreased ring radius step so edges are tighter and nodes sit closer
-  const totalNodesCount = nodes.length;
-  const RING_RADIUS_STEP = totalNodesCount > 40 ? 255 : totalNodesCount > 20 ? 235 : 210;
 
+  // Central Brain Node at origin
   positions.set('brain', { x: 0, y: 0, depth: 0, angle: 0 });
+
+  // Generous Ring Spacing & Brain Clearance Offset (matching user design screenshot)
+  const totalNodesCount = nodes.length;
+  const FIRST_RING_OFFSET = 180; // 180px extra radius gap around central Brain
+  const RING_RADIUS_STEP = totalNodesCount > 40 ? 260 : totalNodesCount > 20 ? 240 : 220;
 
   let currentAngle = -Math.PI / 2; // Start top
   const totalRootLeaves = rootIds.reduce((sum, id) => sum + (leafCountMap.get(id) || 1), 0);
 
   function layoutSubtree(id, depth, startAngle, endAngle) {
     const children = childrenMap.get(id) || [];
-    const radius = depth * RING_RADIUS_STEP;
+    // Radius formula pushes Level 1 nodes 420px out from brain center
+    const radius = FIRST_RING_OFFSET + (depth * RING_RADIUS_STEP);
 
     const midAngle = (startAngle + endAngle) / 2;
     const x = Math.round(Math.cos(midAngle) * radius);
