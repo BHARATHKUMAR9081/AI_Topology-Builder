@@ -10,7 +10,6 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: production
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,9 +28,12 @@ jobs:
           echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
 
       - name: Build Docker image
+        env:
+          ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+          ECR_REPOSITORY: ai-topology-builder
+          IMAGE_TAG: ${{ steps.tag.outputs.IMAGE_TAG }}
         run: |
-          IMAGE_TAG=${{ steps.tag.outputs.IMAGE_TAG }}
-          docker build -t "759204735992.dkr.ecr.ap-south-1.amazonaws.com/ai-topology-builder:$IMAGE_TAG" .
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
 
       - name: Install AWS CLI
         run: |
@@ -45,41 +47,45 @@ jobs:
           echo "AWS_REGION=ap-south-1" >> $GITHUB_ENV
 
       - name: Login to Amazon ECR
+        env:
+          ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+          AWS_REGION: ap-south-1
         run: |
-          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
 
       - name: Push Docker image
+        env:
+          ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+          ECR_REPOSITORY: ai-topology-builder
+          IMAGE_TAG: ${{ steps.tag.outputs.IMAGE_TAG }}
         run: |
-          IMAGE_TAG=${{ steps.tag.outputs.IMAGE_TAG }}
-          docker push "759204735992.dkr.ecr.ap-south-1.amazonaws.com/ai-topology-builder:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
       - name: Deploy to EC2 via SSM
+        env:
+          REGION: ap-south-1
+          INSTANCE_ID: i-05117d1e50047cbeb
+          ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+          ECR_REPOSITORY: ai-topology-builder
+          IMAGE_TAG: ${{ steps.tag.outputs.IMAGE_TAG }}
         run: |
-          set -e
-          IMAGE_URI="759204735992.dkr.ecr.ap-south-1.amazonaws.com/ai-topology-builder:${{ steps.tag.outputs.IMAGE_TAG }}"
-          INSTANCE_ID="i-05117d1e50047cbeb"
-          REGION="ap-south-1"
-          ECR_REGISTRY="759204735992.dkr.ecr.ap-south-1.amazonaws.com"
-
-          cat > /tmp/ssm-params.json <<EOF
+          cat > /tmp/ssm-params.json <<'SSMPARAMS'
           {
             "commands": [
               "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $IMAGE_URI",
+              "docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app $IMAGE_URI"
+              "docker run -d --restart always -p 80:80 --name app $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
             ]
           }
-          EOF
-
+          SSMPARAMS
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --region "$REGION" \
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
-
           echo "SSM Command ID: $COMMAND_ID"
 
       - name: Wait for deployment to initialize
