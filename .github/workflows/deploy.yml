@@ -10,6 +10,12 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: production
+    env:
+      REGION: ap-south-1
+      ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+      ECR_REPOSITORY: ai-topology-builder
+      INSTANCE_ID: i-05117d1e50047cbeb
+      PUBLIC_URL: http://52.66.40.31
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -24,50 +30,32 @@ jobs:
 
       - name: Determine image tag
         id: tag
-        run: |
-          echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+        run: echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
 
       - name: Build Docker image
+        run: |
+          IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          echo "Building image $IMAGE"
+          docker build -t "$IMAGE" .
+          echo "::set-output name=IMAGE_URI::$IMAGE"
+
+      - name: Log in to Amazon ECR
         env:
-          ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
-          ECR_REPOSITORY: ai-topology-builder
-          IMAGE_TAG: ${{ steps.tag.outputs.IMAGE_TAG }}
+          ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
+          AWS_REGION: ${{ env.REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
-
-      - name: Install AWS CLI
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y awscli
-
-      - name: Configure AWS credentials
-        run: |
-          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
-          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
-          echo "AWS_REGION=ap-south-1" >> $GITHUB_ENV
-
-      - name: Login to Amazon ECR
-        env:
-          ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
-          AWS_REGION: ap-south-1
-        run: |
-          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
       - name: Push Docker image
-        env:
-          ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
-          ECR_REPOSITORY: ai-topology-builder
-          IMAGE_TAG: ${{ steps.tag.outputs.IMAGE_TAG }}
         run: |
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          echo "Pushing image $IMAGE_URI"
+          docker push "$IMAGE_URI"
 
-      - name: Deploy to EC2 via SSM
-        env:
-          REGION: ap-south-1
-          INSTANCE_ID: i-05117d1e50047cbeb
-          ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
-          ECR_REPOSITORY: ai-topology-builder
-          IMAGE_TAG: ${{ steps.tag.outputs.IMAGE_TAG }}
+      - name: Prepare SSM command parameters
         run: |
           cat > /tmp/ssm-params.json <<'SSMPARAMS'
           {
@@ -80,13 +68,22 @@ jobs:
             ]
           }
           SSMPARAMS
-          COMMAND_ID=$(aws ssm send-command \
+
+      - name: Deploy to EC2 via SSM
+        env:
+          REGIONAL: ${{ env.REGION }}
+          INSTANCE_ID: ${{ env.INSTANCE_ID }}
+          ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ steps.tag.outputs.IMAGE_TAG }}
+        run: |
+          CMD_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
-            --region "$REGION" \
+            --region "$REGIONAL" \
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
-          echo "SSM Command ID: $COMMAND_ID"
+          echo "SSM Command ID: $CMD_ID"
 
       - name: Wait for deployment to initialize
         run: sleep 60
@@ -94,7 +91,7 @@ jobs:
       - name: Health check
         run: |
           for i in {1..10}; do
-            if curl --fail --silent -o /dev/null http://52.66.40.31; then
+            if curl --fail --silent -o /dev/null "$PUBLIC_URL"; then
               echo "Health check succeeded."
               exit 0
             else
