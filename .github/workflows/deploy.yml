@@ -1,0 +1,146 @@
+# This workflow builds, deploys, and verifies the AI Topology Builder to an EC2 instance running Docker.
+# It is compliant with the restricted set of GitHub Actions and uses AWS CLI directly for all
+# interactions with AWS (ECR and SSM).
+
+name: Deploy to EC2 (Docker)
+
+on:
+  push:
+    branches: [ main ]
+    tags: ['*']
+  workflow_dispatch:
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout the repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Set up Node.js
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # Install dependencies
+      - name: Install dependencies
+        run: npm ci
+
+      # Build the production bundle
+      - name: Build application
+        run: npm run build
+
+      # Generate a Dockerfile for the current artifact (no existing Dockerfile in repo)
+      - name: Create temporary Dockerfile
+        run: |
+          cat <<'EOF' > Dockerfile
+          FROM node:20-alpine AS builder
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci
+          COPY . .
+          RUN npm run build
+
+          FROM node:20-alpine
+          WORKDIR /app
+          COPY --from=builder /app/package*.json ./
+          RUN npm ci --only=production
+          COPY --from=builder /app/build ./dist
+          COPY --from=builder /app/server ./server
+          EXPOSE 80
+          CMD ["node", "server/index.js"]
+          EOF
+
+      # Set up Docker credentials and build the image
+      - name: Set up Docker and build image
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com
+          ECR_REPOSITORY=ai-topology-builder
+          IMAGE_URI=${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+
+          echo "IMAGE_URI=${IMAGE_URI}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+          docker build -t ${IMAGE_URI} .
+
+      # Install AWS CLI (not available by default on ubuntu-latest)
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y awscli
+
+      # Configure AWS credentials from repository secrets
+      - name: Configure AWS credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=ap-south-1" >> $GITHUB_ENV
+
+      # Login to Amazon ECR
+      - name: Log in to Amazon ECR
+        run: |
+          aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+
+      # Push the image to ECR
+      - name: Push image to ECR
+        run: |
+          docker push "${IMAGE_URI}"
+
+      # Deploy the new image to the EC2 instance via SSM
+      - name: Deploy via SSM
+        env:
+          REGION: ap-south-1
+          INSTANCE_ID: i-05117d1e50047cbeb
+          IMAGE_URI: ${{ env.IMAGE_URI }}
+          ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+        run: |
+          cat > /tmp/ssm-params.json <<'SSMPARAMS'
+          {
+            "commands": [
+              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "docker pull $IMAGE_URI",
+              "docker stop app || true",
+              "docker rm app || true",
+              "docker run -d --restart always -p 80:80 --name app $IMAGE_URI"
+            ]
+          }
+          SSMPARAMS
+          aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --region "$REGION" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "file:///tmp/ssm-params.json" \
+            --query "Command.CommandId" \
+            --output text
+
+      # Wait a moment for containers to start
+      - name: Wait for deployment
+        run: sleep 45
+
+      # Verify the deployment is healthy (HTTP 200)
+      - name: Health check
+        run: |
+          set -e
+          URL="http://52.66.40.31"
+          echo "Performing health check against ${URL}"
+          for i in {1..10}; do
+            if curl -s -o /dev/null -w "%{http_code}" "$URL" | grep -q "^200$"; then
+              echo "Health check succeeded."
+              exit 0
+            fi
+            echo "Attempt $i failed; retrying in 5s..."
+            sleep 5
+          done
+          echo "Health check failed after multiple attempts."
+          exit 1
+
+      # Optional: Clean up the temporary Dockerfile
+      - name: Clean temporary Dockerfile
+        if: always()
+        run: rm -f Dockerfile
