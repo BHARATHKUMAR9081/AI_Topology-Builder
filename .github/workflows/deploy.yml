@@ -16,6 +16,7 @@ jobs:
       ECR_REPOSITORY_URI: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/ai-topology-builder
       PUBLIC_URL: http://52.66.40.31
       CONTAINER_PORT: 80
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -34,14 +35,13 @@ jobs:
         run: |
           IMAGE_TAG=${GITHUB_SHA::8}
           echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_OUTPUT
-          IMAGE_URI="${ECR_REPOSITORY_URI}:${IMAGE_TAG}"
+          ECR_REGISTRY=$(echo "${{ env.ECR_REPOSITORY_URI }}" | cut -d'/' -f1)
+          IMAGE_URI="${ECR_REGISTRY}:${IMAGE_TAG}"
           echo "IMAGE_URI=${IMAGE_URI}" >> $GITHUB_OUTPUT
 
       - name: Build Docker image
         run: |
-          docker build -t "${IMAGE_URI}" .
-        env:
-          IMAGE_URI: ${{ steps.image.outputs.IMAGE_URI }}
+          docker build -t "${{ steps.image.outputs.IMAGE_URI }}" .
 
       - name: Install AWS CLI
         run: |
@@ -53,8 +53,8 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          ECR_REGISTRY=$(echo "${{ steps.image.outputs.IMAGE_URI }}" | cut -d'/' -f1)
-          aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          ECR_REGISTRY=$(echo "${{ env.ECR_REPOSITORY_URI }}" | cut -d'/' -f1)
+          aws ecr get-login-password --region "${{ env.REGION }}" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
           docker push "${{ steps.image.outputs.IMAGE_URI }}"
 
       - name: Deploy to EC2 instance via SSM
@@ -64,21 +64,21 @@ jobs:
         run: |
           set -e
           IMAGE_URI="${{ steps.image.outputs.IMAGE_URI }}"
-          ECR_REGISTRY=$(echo "$IMAGE_URI" | cut -d'/' -f1)
+          ECR_REGISTRY=$(echo "${{ env.ECR_REPOSITORY_URI }}" | cut -d'/' -f1)
           cat > /tmp/ssm-params.json <<EOF
           {
             "commands": [
-              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "aws ecr get-login-password --region ${{ env.REGION }} | docker login --username AWS --password-stdin $ECR_REGISTRY",
               "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p $CONTAINER_PORT:$CONTAINER_PORT --name app $IMAGE_URI"
+              "docker run -d --restart always -p ${{ env.CONTAINER_PORT }}:${{ env.CONTAINER_PORT }} --name app $IMAGE_URI"
             ]
           }
           EOF
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
-            --region "$REGION" \
+            --region "${{ env.REGION }}" \
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
@@ -89,7 +89,7 @@ jobs:
 
       - name: Health check
         run: |
-          echo "Health checking $PUBLIC_URL"
+          PUBLIC_URL=${{ env.PUBLIC_URL }}
           for i in {1..10}; do
             if curl --fail --silent -o /dev/null "$PUBLIC_URL"; then
               echo "Health check succeeded."
