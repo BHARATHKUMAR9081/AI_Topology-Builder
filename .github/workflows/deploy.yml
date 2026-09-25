@@ -9,15 +9,14 @@ on:
 jobs:
   build_and_deploy:
     runs-on: ubuntu-latest
+    environment: production
     env:
       REGION: ap-south-1
       INSTANCE_ID: i-05117d1e50047cbeb
       PUBLIC_URL: http://52.66.40.31
       DETECTED_CONTAINER_PORT: 80
       ECR_REPOSITORY_URI: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/ai-topology-builder
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-
+      DOCKERFILE_PATH: .
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,30 +35,35 @@ jobs:
         run: |
           IMAGE_TAG=${GITHUB_SHA::8}
           echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_OUTPUT
-          IMAGE_URI="${{ env.ECR_REPOSITORY_URI }}:${IMAGE_TAG}"
+          IMAGE_URI="${ECR_REPOSITORY_URI}:${IMAGE_TAG}"
           echo "IMAGE_URI=${IMAGE_URI}" >> $GITHUB_OUTPUT
 
       - name: Build Docker image
         run: |
           docker build -t "${{ steps.image.outputs.IMAGE_URI }}" .
 
-      - name: Push Docker image to ECR
-        run: |
-          docker push "${{ steps.image.outputs.IMAGE_URI }}"
-
       - name: Install AWS CLI
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y awscli
 
+      - name: Push image to ECR
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          ECR_REGISTRY=$(echo "${{ steps.image.outputs.IMAGE_URI }}" | cut -d'/' -f1)
+          aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          docker push "${{ steps.image.outputs.IMAGE_URI }}"
+
       - name: Deploy to EC2 instance via SSM
         env:
-          REGION: ${{ env.REGION }}
-          INSTANCE_ID: ${{ env.INSTANCE_ID }}
-          IMAGE_URI: ${{ steps.image.outputs.IMAGE_URI }}
-          ECR_URI: ${{ env.ECR_REPOSITORY_URI }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          ECR_REGISTRY=$(echo "$ECR_URI" | cut -d'/' -f1)
+          set -e
+          IMAGE_URI="${{ steps.image.outputs.IMAGE_URI }}"
+          ECR_REGISTRY=$(echo "$IMAGE_URI" | cut -d'/' -f1)
           cat > /tmp/ssm-params.json <<EOF
           {
             "commands": [
@@ -67,7 +71,7 @@ jobs:
               "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app $IMAGE_URI"
+              "docker run -d --restart always -p $DETECTED_CONTAINER_PORT:$DETECTED_CONTAINER_PORT --name app $IMAGE_URI"
             ]
           }
           EOF
