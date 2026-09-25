@@ -14,6 +14,7 @@ env:
   IMAGE_TAG: latest
   INSTANCE_ID: i-03d0609dca0af1daa
   PUBLIC_URL: http://3.7.92.177
+  DEFAULT_BRANCH: main
 
 jobs:
   deploy:
@@ -23,67 +24,66 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: npm
 
-      - name: Install npm dependencies
+      - name: Install dependencies
         run: npm ci
 
-      - name: Build production assets
+      - name: Build assets
         run: npm run build
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Set IMAGE_URI
+        run: |
+          echo "IMAGE_URI=${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" >> $GITHUB_ENV
+
+      - uses: docker/setup-buildx-action@v3
 
       - name: Build Docker image
-        id: build-image
-        run: |
-          IMAGE_URI=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
-          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_OUTPUT
-          docker build -t $IMAGE_URI .
+        run: docker build -t $IMAGE_URI .
 
-      - name: Log in to Amazon ECR
+      - name: ECR login
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.REGION }}
+          ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
         run: |
-          aws ecr get-login-password --region ${{ env.REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+          aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | \
+            docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
       - name: Push Docker image to ECR
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: |
-          IMAGE_URI=${{ steps.build-image.outputs.image-uri }}
-          docker push $IMAGE_URI
+          AWS_DEFAULT_REGION: ${{ env.REGION }}
+        run: docker push $IMAGE_URI
 
-      - name: Prepare SSM deployment script
+      - name: Write SSM command file
         run: |
-          cat > /tmp/ssm-params.json <<'SSMPARAMS'
+          cat > /tmp/ssm-params.json <<EOF
           {
             "commands": [
-              "aws ecr get-login-password --region ${{ env.REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}",
-              "docker pull ${{ steps.build-image.outputs.image-uri }}",
+              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app ${{ steps.build-image.outputs.image-uri }}"
+              "docker run -d --restart always -p 80:80 --name app $IMAGE_URI"
             ]
           }
-          SSMPARAMS
-          echo "SSM script created at /tmp/ssm-params.json"
+          EOF
 
-      - name: Send SSM command to EC2 instance
+      - name: Execute SSM command on EC2 instance
         id: ssm
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           INSTANCE_ID: ${{ env.INSTANCE_ID }}
           REGION: ${{ env.REGION }}
-          IMAGE_URI: ${{ steps.build-image.outputs.image-uri }}
-          ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.REGION }}
         run: |
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
