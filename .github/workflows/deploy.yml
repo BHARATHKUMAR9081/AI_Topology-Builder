@@ -28,7 +28,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: npm
 
       - name: Install dependencies
         run: npm ci
@@ -52,13 +51,11 @@ jobs:
       - name: Build Docker image
         run: |
           FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          echo "Building Docker image $FULL_IMAGE"
-          docker build -t "$FULL_IMAGE" .
           echo "FULL_IMAGE=$FULL_IMAGE" >> $GITHUB_ENV
+          docker build -t "$FULL_IMAGE" .
 
       - name: Push Docker image
         run: |
-          echo "Pushing Docker image $FULL_IMAGE"
           docker push "$FULL_IMAGE"
 
       - name: Write SSM command payload
@@ -92,4 +89,4 @@ jobs:
       - name: Health check
         run: |
           echo "Checking health at $PUBLIC_URL"
-          curl -fL "$PUBLIC_URL" || exit 1   <!-- Ends job with failure if health check fails -->
+          curl -fL "$PUBLIC_URL" || exit 1
