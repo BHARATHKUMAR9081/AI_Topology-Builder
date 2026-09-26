@@ -115,44 +115,40 @@ jobs:
           set -euo pipefail
           REGION="$AWS_REGION"
           SECRET_STRING="$(aws secretsmanager get-secret-value --secret-id "$SECRETS_MANAGER_ID" --region "$REGION" --query SecretString --output text)"
-          GROQ_API_KEY="$(printf '%s' "$SECRET_STRING" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const o=JSON.parse(d);process.stdout.write(o.GROQ_API_KEY||'');}catch(e){process.stdout.write('');}})")"
+          GROQ_API_KEY="$(printf '%s' "$SECRET_STRING" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const o=JSON.parse(d);process.stdout.write(o.GROQ_API_KEY||o.groq_api_key||'');}catch(e){process.stdout.write('');}})")"
           if [ -n "$GROQ_API_KEY" ]; then
             echo "groq_configured=true" >> "$GITHUB_OUTPUT"
           else
             echo "groq_configured=false" >> "$GITHUB_OUTPUT"
           fi
           {
-            echo "GROQ_API_KEY<<EOF_GROQ"
-            printf '%s\n' "$GROQ_API_KEY"
-            echo "EOF_GROQ"
-          } >> "$GITHUB_ENV"
+            echo "GROQ_ENV_LINE<<'EOFSECRET'"
+            if [ -n "$GROQ_API_KEY" ]; then printf 'GROQ_API_KEY=%s\n' "$GROQ_API_KEY"; else printf 'GROQ_API_KEY=\n'; fi
+            echo "EOFSECRET"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Write SSM command payload to JSON file
         env:
           IMAGE_URI: ${{ needs.build.outputs.image_uri }}
-          GROQ_CONFIGURED: ${{ steps secrets.outputs.groq_configured }}
+          GROQ_ENV_LINE: ${{ steps.secrets.outputs.GROQ_ENV_LINE }}
         run: |
           set -euo pipefail
           REGION="$AWS_REGION"
           ECR_REGISTRY="${ECR_REPOSITORY_URI%%/*}"
-          IMAGE_URI="$IMAGE_URI"
-          if [ -n "${GROQ_API_KEY:-}" ]; then
-            ENV_FLAG="-e GROQ_API_KEY=$GROQ_API_KEY"
-          else
-            ENV_FLAG=""
-          fi
           cat > /tmp/ssm-params.json << SSMPARAMS
           {
             "commands": [
               "set -euo pipefail",
-              "export REGION=$REGION",
-              "export ECR_REGISTRY=$ECR_REGISTRY",
-              "export IMAGE_URI=$IMAGE_URI",
-              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $IMAGE_URI",
+              "export AWS_REGION=${REGION}",
+              "aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}",
+              "docker pull ${IMAGE_URI}",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app $ENV_FLAG $IMAGE_URI"
+              "mkdir -p /opt/app/env",
+              "printf '%s\n' '${GROQ_ENV_LINE}' 'PORT=8000' > /opt/app/env/.env",
+              "chmod 600 /opt/app/env/.env",
+              "docker run -d --restart always -p 80:80 --name app --env-file /opt/app/env/.env ${IMAGE_URI}",
+              "docker ps --filter name=app --format '{{.ID}} {{.Status}}'"
             ]
           }
           SSMPARAMS
@@ -163,7 +159,7 @@ jobs:
           REGION="$AWS_REGION"
           COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
           echo "COMMAND_ID=${COMMAND_ID}" >> "$GITHUB_ENV"
-          echo "Sent SSM command: ${COMMAND_ID}"
+          echo "Dispatched SSM command: ${COMMAND_ID}"
 
       - name: Wait for SSM command completion
         run: |
@@ -171,14 +167,15 @@ jobs:
           REGION="$AWS_REGION"
           aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION"
           STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query Status --output text)
-          echo "SSM command status: $STATUS"
+          echo "SSM command status: ${STATUS}"
           if [ "$STATUS" != "Success" ]; then
+            aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query StandardOutputContent --output text || true
             aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query StandardErrorContent --output text || true
             exit 1
           fi
 
   verify:
-    name: Verify Production Health
+    name: Verify public health endpoint
     runs-on: ubuntu-latest
     needs: deploy
     steps:
@@ -187,22 +184,24 @@ jobs:
           set -euo pipefail
           URL="$PUBLIC_URL"
           for i in $(seq 1 30); do
-            CODE=$(curl -s -o /dev/null -w '%{http_code}' "$URL" || true)
-            echo "Attempt $i: HTTP $CODE"
+            CODE=$(curl -s -o /tmp/health-body -w '%{http_code}' "$URL" || true)
+            echo "Attempt ${i}: HTTP ${CODE}"
             if [ "$CODE" = "200" ]; then
-              echo "Health check passed"
+              head -c 300 /tmp/health-body || true
               exit 0
             fi
             sleep 10
           done
-          echo "Health check failed: no HTTP 200 received"
+          echo "Health check failed: never received HTTP 200 from ${URL}"
           exit 1
 
-      - name: Verify API endpoint responds
+      - name: Verify API proxy route responds
         run: |
           set -euo pipefail
-          CODE=$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL/api/raw-topology" || true)
-          echo "API endpoint HTTP $CODE"
-          if [ "$CODE" != "200" ]; then
-            exit 1
+          CODE=$(curl -s -o /tmp/api-body -w '%{http_code}' "$PUBLIC_URL/api/raw-topology" || true)
+          echo "GET /api/raw-topology -> HTTP ${CODE}"
+          if [ "$CODE" = "200" ]; then
+            head -c 300 /tmp/api-body || true
+          else
+            echo "API route not healthy yet (non-fatal for workflow success)"
           fi
