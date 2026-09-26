@@ -1,23 +1,23 @@
 name: Build Deploy Verify AI Topology Builder
 
 on:
-  workflow_dispatch:
   push:
     branches: [main]
+  workflow_dispatch:
 
 env:
   AWS_REGION: ap-south-1
+  ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPOSITORY: ai-topology-builder
+  INSTANCE_ID: i-0a00d5f35e546e425
+  PUBLIC_URL: http://13.234.150.98
+  CONTAINER_PORT: "8000"
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  ECR_REPOSITORY_URI: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/ai-topology-builder
-  INSTANCE_ID: i-080a6990e1715a190
-  PUBLIC_URL: http://43.204.165.22
-  SECRETS_MANAGER_ID: deptic/AI_Topology-Builder/secrets
-  CONTAINER_PORT: 80
 
 jobs:
   build:
-    name: Build Diagnostics and Docker Image to ECR
+    name: Build Diagnostics and Docker Image
     runs-on: ubuntu-latest
     outputs:
       image_tag: ${{ steps.meta.outputs.image_tag }}
@@ -32,37 +32,26 @@ jobs:
           node-version: 20
           cache: npm
 
-      - name: Build diagnostics - toolchain and repository layout
+      - name: Build diagnostics
         run: |
-          set -e
-          echo "--- Build diagnostics ---"
+          set -euo pipefail
+          echo "--- node/npm versions ---"
           node --version
           npm --version
-          docker --version
-          echo "--- Repository root ---"
+          echo "--- repository layout ---"
           ls -la
           echo "--- package.json scripts ---"
-          cat package.json
-          echo "--- vite.config.js ---"
-          cat vite.config.js
-          echo "--- Dockerfile ---"
-          cat Dockerfile
-          test -f Dockerfile || { echo "Dockerfile missing"; exit 1; }
-          test -f server/index.js || { echo "server/index.js missing"; exit 1; }
-          test -f index.html || { echo "index.html missing"; exit 1; }
+          node -e "console.log(JSON.stringify(require('./package.json').scripts, null, 2))"
+          test -f server/index.js && echo "server/index.js present"
+          test -f index.html && echo "index.html (Vite entry) present"
+          test -f Dockerfile && echo "Dockerfile present"
 
-      - name: Install dependencies (frontend + backend)
-        run: npm install --legacy-peer-deps
-
-      - name: Production build (Vite bundle consumed by Dockerfile builder stage)
-        run: npm run build
-
-      - name: Verify frontend build artifact
+      - name: Install dependencies and production build (Vite)
         run: |
-          set -e
-          test -f dist/index.html || { echo "dist/index.html not produced"; exit 1; }
-          echo "dist contents:"
-          ls -la dist
+          set -euo pipefail
+          npm ci --legacy-peer-deps || npm install --legacy-peer-deps
+          npm run build
+          test -f dist/index.html && echo "dist/index.html built successfully"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -70,28 +59,46 @@ jobs:
       - name: Compute image tag and URI
         id: meta
         run: |
+          set -euo pipefail
           IMAGE_TAG="$(git rev-parse --short HEAD)-$(date -u +%Y%m%d%H%M%S)"
-          FULL_IMAGE="$ECR_REPOSITORY_URI:$IMAGE_TAG"
-          {
-            echo "image_tag=$IMAGE_TAG"
-            echo "image_uri=$FULL_IMAGE"
-          } >> "$GITHUB_OUTPUT"
-          echo "IMAGE_URI=$FULL_IMAGE" >> "$GITHUB_ENV"
-          echo "Building and pushing: $FULL_IMAGE"
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image_uri=$FULL_IMAGE:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "FULL_IMAGE=$FULL_IMAGE" >> "$GITHUB_ENV"
 
-      - name: Authenticate Docker to ECR (AWS CLI, static credentials)
+      - name: Authenticate to ECR (AWS CLI, static credentials)
         run: |
-          ECR_REGISTRY="${ECR_REPOSITORY_URI%/*}"
+          set -euo pipefail
           aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-      - name: Build and push Docker image (context = repository root, Dockerfile path = .)
+      - name: Build Docker image (context = repository root, Dockerfile at .)
         run: |
-          docker build -t "$IMAGE_URI" -t "$ECR_REPOSITORY_URI:latest" -f Dockerfile .
-          docker push "$IMAGE_URI"
-          docker push "$ECR_REPOSITORY_URI:latest"
+          set -euo pipefail
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.meta.outputs.image_tag }}" -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" .
+
+      - name: Container smoke test (nginx :80 + node :8000 inside container)
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke -p 8080:80 -e PORT="$CONTAINER_PORT" -e GROQ_API_KEY="" "$ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.meta.outputs.image_tag }}"
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ || true)
+            [ "$CODE" = "200" ] && break
+            sleep 2
+          done
+          [ "$CODE" = "200" ] || { docker logs smoke; echo "Smoke test failed with HTTP $CODE"; exit 1; }
+          echo "Container smoke test passed with HTTP 200"
+          API_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/raw-topology || true)
+          echo "Backend /api/raw-topology via nginx proxy returned HTTP $API_CODE"
+          docker rm -f smoke
+
+      - name: Push image to ECR
+        run: |
+          set -euo pipefail
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.meta.outputs.image_tag }}"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
   deploy:
-    name: Deploy to EC2 via SSM RunShellScript
+    name: Deploy to EC2 via SSM
     runs-on: ubuntu-latest
     needs: build
     steps:
@@ -105,98 +112,72 @@ jobs:
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
-              "set -e",
-              "export AWS_DEFAULT_REGION=ap-south-1",
-              "GROQ_API_KEY=$(aws secretsmanager get-secret-value --secret-id deptic/AI_Topology-Builder/secrets --query SecretString --output text | python3 -c \"import sys, json; print(json.load(sys.stdin).get('GROQ_API_KEY', ''))\" || echo '')",
-              "ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
-              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull IMAGE_URI_PLACEHOLDER",
+              "set -euo pipefail",
+              "export REGION=ap-south-1",
+              "export ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "export IMAGE_URI=${IMAGE_URI}",
+              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "if [ -n \"$GROQ_API_KEY\" ]; then docker run -d --restart always -p 80:80 --name app -e GROQ_API_KEY=$GROQ_API_KEY -e PORT=8000 -e NODE_ENV=production IMAGE_URI_PLACEHOLDER; else docker run -d --restart always -p 80:80 --name app -e PORT=8000 -e NODE_ENV=production IMAGE_URI_PLACEHOLDER; fi",
+              "docker run -d --restart always --name app -p 80:80 -e PORT=8000 -e BACKEND_PORT=8000 -e FRONTEND_PORT=80 -e GROQ_API_KEY=$(aws secretsmanager get-secret-value --secret-id deptic/AI_Topology-Builder/secrets --region $REGION --query SecretString --output text | node -e \"let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const s=JSON.parse(d);console.log(s.GROQ_API_KEY||'')}catch(e){console.log(d.trim())}}\")",
               "docker image prune -f || true"
             ]
           }
           SSMPARAMS
-          sed -i "s|IMAGE_URI_PLACEHOLDER|$IMAGE_URI|g" /tmp/ssm-params.json
-          echo "--- SSM parameters payload ---"
-          cat /tmp/ssm-params.json
 
       - name: Send SSM command to EC2 instance
+        env:
+          IMAGE_URI: ${{ needs.build.outputs.image_uri }}
         run: |
-          set -e
+          set -euo pipefail
+          echo "Deploying image: $IMAGE_URI"
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --region "$AWS_REGION" \
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm-params.json \
-            --query "Command.CommandId" \
-            --output text)
+            --query "Command.CommandId" --output text)
           echo "COMMAND_ID=$COMMAND_ID"
           echo "COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
 
       - name: Wait for SSM command completion
         run: |
-          set -e
-          STATUS=""
+          set -euo pipefail
           for i in $(seq 1 60); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --region "$AWS_REGION" \
-              --query "Status" --output text 2>/dev/null || echo "Pending")
-            echo "Attempt $i: SSM status=$STATUS"
+            STATUS=$(aws ssm list-commands --command-id "$COMMAND_ID" --region "$AWS_REGION" --query "Commands[0].Status" --output text)
+            echo "SSM status: $STATUS"
             case "$STATUS" in
-              Success) echo "SSM command succeeded"; exit 0 ;;
-              InProgress|Pending|Delayed) sleep 10 ;;
-              *) echo "SSM command failed with status: $STATUS"; exit 1 ;;
+              Success) echo "Deploy command succeeded"; exit 0 ;;
+              Failed|Cancelled|TimedOut) echo "Deploy command failed with status $STATUS"; exit 1 ;;
             esac
+            sleep 10
           done
           echo "Timed out waiting for SSM command"; exit 1
 
-      - name: Show SSM command output
-        if: always()
-        run: |
-          aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --query "{Status:Status,StdOut:StandardOutputContent,StdErr:StandardErrorContent}" \
-            || true
-
   verify:
-    name: Verify public health endpoint returns HTTP 200
+    name: Verify production health
     runs-on: ubuntu-latest
-    needs: [build, deploy]
+    needs: deploy
     steps:
       - name: Health check public URL (HTTP 200 required)
         run: |
-          set -e
-          echo "Waiting for nginx + node container to come up on $PUBLIC_URL ..."
-          sleep 10
+          set -euo pipefail
           for i in $(seq 1 30); do
-            CODE=$(curl -s -o /tmp/body.html -w "%{http_code}" "$PUBLIC_URL/" || true)
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL/" || true)
             echo "Attempt $i: HTTP $CODE"
-            if [ "$CODE" = "200" ]; then
-              echo "--- response body (head) ---"
-              head -c 500 /tmp/body.html || true
-              echo "Health check passed: HTTP 200 from $PUBLIC_URL"
-              exit 0
-            fi
-            sleep 10
+            [ "$CODE" = "200" ] && break
+            sleep 5
           done
-          echo "Health check failed: never received HTTP 200 from $PUBLIC_URL"
-          exit 1
+          if [ "$CODE" != "200" ]; then echo "Health check failed: HTTP $CODE"; exit 1; fi
+          echo "Health check passed: HTTP 200 from $PUBLIC_URL/"
 
-      - name: Verify backend API proxy through nginx (/api/raw-topology)
+      - name: Verify backend API proxy through nginx
         run: |
-          set -e
-          CODE=$(curl -s -o /tmp/api.json -w "%{http_code}" "$PUBLIC_URL/api/raw-topology" || true)
-          echo "API endpoint HTTP code: $CODE"
-          if [ "$CODE" = "200" ]; then
-            head -c 500 /tmp/api.json || true
-            echo ""
-            echo "Backend proxy verified: /api/raw-topology returned HTTP 200"
-          else
-            echo "WARNING: /api/raw-topology returned HTTP $CODE (frontend still served)"
-          fi
+          set -euo pipefail
+          API_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL/api/raw-topology" || true)
+          echo "GET /api/raw-topology -> HTTP $API_CODE"
+          if [ "$API_CODE" != "200" ]; then echo "Backend proxy check failed"; exit 1; fi
+          curl -s "$PUBLIC_URL/api/raw-topology" | head -c 300
+          echo ""
+          echo "Verification complete: frontend and backend healthy at $PUBLIC_URL"
