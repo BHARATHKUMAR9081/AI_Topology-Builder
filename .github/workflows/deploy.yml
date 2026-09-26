@@ -13,7 +13,7 @@ env:
   INSTANCE_ID: i-080a6990e1715a190
   PUBLIC_URL: http://43.204.165.22
   SECRETS_MANAGER_ID: deptic/AI_Topology-Builder/secrets
-  CONTAINER_PORT: 8000
+  CONTAINER_PORT: 80
 
 jobs:
   build:
@@ -43,6 +43,8 @@ jobs:
           ls -la
           echo "--- package.json scripts ---"
           cat package.json
+          echo "--- vite.config.js ---"
+          cat vite.config.js
           test -f Dockerfile || { echo "Dockerfile missing"; exit 1; }
           test -f server/index.js || { echo "server/index.js missing"; exit 1; }
           test -f index.html || { echo "index.html missing"; exit 1; }
@@ -102,81 +104,104 @@ jobs:
               "set -e",
               "export AWS_REGION=ap-south-1",
               "ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
-              "IMAGE_URI=759204735992.dkr.ecr.ap-south-1.amazonaws.com/ai-topology-builder:${{ needs.build.outputs.image_tag }}",
+              "IMAGE_URI=${{ needs.build.outputs.image_uri }}",
               "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
               "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "ENV_JSON=$(aws secretsmanager get-secret-value --secret-id deptic/AI_Topology-Builder/secrets --region ap-south-1 --query SecretString --output text)",
-              "GROQ_API_KEY=$(echo \"$ENV_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"GROQ_API_KEY\",\"\"))' 2>/dev/null || true)",
-              "PORT=$(echo \"$ENV_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"PORT\",\"8000\"))' 2>/dev/null || echo 8000)",
-              "docker run -d --restart always -p 80:80 --name app -e GROQ_API_KEY=\"$GROQ_API_KEY\" -e PORT=\"$PORT\" $IMAGE_URI",
-              "docker ps --filter name=app --format '{{.ID}} {{.Status}}'"
+              "docker run -d --restart always -p 80:80 --name app -e PORT=8000 -e NODE_ENV=production $IMAGE_URI",
+              "docker image prune -f || true"
             ]
           }
           SSMPARAMS
+          echo "SSM payload written:"
           cat /tmp/ssm-params.json
 
       - name: Send SSM command to EC2 instance
         run: |
+          set -e
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --region "$AWS_REGION" \
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm-params.json \
-            --query "Command.CommandId" --output text)
+            --query "Command.CommandId" \
+            --output text)
           echo "COMMAND_ID=$COMMAND_ID"
-          echo "SSM_COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
+          echo "COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
 
       - name: Wait for SSM command completion
         run: |
-          echo "Waiting for SSM command $SSM_COMMAND_ID on $INSTANCE_ID"
-          aws ssm wait command-executed \
-            --command-id "$SSM_COMMAND_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --region "$AWS_REGION"
-          STATUS=$(aws ssm get-command-invocation \
-            --command-id "$SSM_COMMAND_ID" \
+          set -e
+          STATUS=""
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm list-commands \
+              --command-id "$COMMAND_ID" \
+              --region "$AWS_REGION" \
+              --query "Commands[0].Status" \
+              --output text)
+            echo "Attempt $i: SSM status=$STATUS"
+            if [ "$STATUS" = "Success" ]; then
+              echo "SSM command succeeded"
+              exit 0
+            fi
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "SSM command failed with status $STATUS"
+              break
+            fi
+            sleep 10
+          done
+          echo "--- SSM command output (Errors) ---"
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
             --instance-id "$INSTANCE_ID" \
             --region "$AWS_REGION" \
-            --query "Status" --output text)
-          echo "SSM final status: $STATUS"
-          if [ "$STATUS" != "Success" ]; then
-            echo "--- stdout ---"
-            aws ssm get-command-invocation --command-id "$SSM_COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query "StandardOutputContent" --output text || true
-            echo "--- stderr ---"
-            aws ssm get-command-invocation --command-id "$SSM_COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query "StandardErrorContent" --output text || true
-            exit 1
-          fi
+            --query "StandardErrorContent" \
+            --output text || true
+          exit 1
 
   verify:
-    name: Verify public endpoint health
+    name: Verify public deployment over HTTP
     runs-on: ubuntu-latest
     needs: deploy
     steps:
-      - name: Health check http://43.204.165.22 (HTTP 200 required)
+      - name: Wait for nginx + node app to boot on instance
+        run: sleep 15
+
+      - name: Health check public URL (HTTP 200 required)
         run: |
-          URL="http://43.204.165.22"
+          set -e
           for i in $(seq 1 30); do
-            CODE=$(curl -s -o /tmp/health-body -w '%{http_code}' "$URL" || true)
+            CODE=$(curl -s -o /tmp/index.html -w "%{http_code}" "$PUBLIC_URL/" || true)
             echo "Attempt $i: HTTP $CODE"
             if [ "$CODE" = "200" ]; then
               echo "Health check passed with HTTP 200"
-              head -c 400 /tmp/health-body || true
+              head -c 400 /tmp/index.html || true
               exit 0
             fi
             sleep 10
           done
-          echo "Health check failed: never received HTTP 200 from $URL"
+          echo "Health check failed: never received HTTP 200 from $PUBLIC_URL"
           exit 1
 
-      - name: Verify nginx /api proxy responds through port 80
+      - name: Verify backend API proxy through nginx (/api/raw-topology)
         run: |
-          CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://43.204.165.22/api/raw-topology" || true)
-          echo "/api/raw-topology responded with HTTP $CODE"
-          if [ "$CODE" = "000" ] || [ "$CODE" = "502" ] || [ "$CODE" = "503" ] && false; then
+          set -e
+          CODE=$(curl -s -o /tmp/raw-topology.json -w "%{http_code}" "$PUBLIC_URL/api/raw-topology")
+          echo "GET /api/raw-topology -> HTTP $CODE"
+          if [ "$CODE" != "200" ]; then
+            echo "Backend API health check failed"
             exit 1
           fi
-          if [ "$CODE" = "200" ]; then
-            curl -s "http://43.204.165.22/api/raw-topology" | head -c 400 || true
-          fi
+          cat /tmp/raw-topology.json
+          node -e "const d=require('/tmp/raw-topology.json'); if(!d.servers || !d.system){console.error('unexpected payload');process.exit(1)}; console.log('Backend payload OK:', d.system)"
+
+      - name: Deployment summary
+        run: |
+          {
+            echo "### AI Topology Builder deployment"
+            echo "- Image: ${{ needs.build.outputs.image_uri }}"
+            echo "- Instance: $INSTANCE_ID"
+            echo "- Public URL: $PUBLIC_URL"
+            echo "- Container port (nginx): $CONTAINER_PORT"
+          } >> "$GITHUB_STEP_SUMMARY"
