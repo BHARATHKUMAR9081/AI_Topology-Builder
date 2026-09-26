@@ -93,11 +93,12 @@ jobs:
             sleep 2
           done
           [ "$CODE" = "200" ] || { docker logs smoke; echo "Smoke test failed with HTTP $CODE"; exit 1; }
-          echo "Container smoke test passed with HTTP 200"
+          echo "Container smoke test passed (HTTP 200 on nginx :80)"
           API_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/raw-topology || true)
-          echo "Backend /api/raw-topology via nginx proxy returned HTTP $API_CODE"
-          [ "$API_CODE" = "200" ] || { docker logs smoke; echo "Backend smoke test failed with HTTP $API_CODE"; exit 1; }
-          docker stop smoke && docker rm smoke
+          echo "GET /api/raw-topology via nginx proxy -> HTTP $API_CODE"
+          [ "$API_CODE" = "200" ] || { docker logs smoke; echo "API proxy check failed with HTTP $API_CODE"; exit 1; }
+          docker stop smoke || true
+          docker rm smoke || true
 
       - name: Push Docker image to ECR
         run: |
@@ -106,44 +107,34 @@ jobs:
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
   deploy:
-    name: Deploy to EC2 via SSM RunShellScript
+    name: Deploy to EC2 via SSM (Docker)
     needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Refresh Groq env secret on instance via Secrets Manager (best effort)
+      - name: Write SSM command payload to JSON file
         run: |
           set -euo pipefail
-          GROQ_KEY=$(aws secretsmanager get-secret-value --secret-id "$SECRETS_MANAGER_ID" --region "$AWS_REGION" --query SecretString --output text 2>/dev/null || true)
-          if [ -n "$GROQ_KEY" ]; then
-            echo "GROQ_ENV_LINE=GROQ_API_KEY=$(echo "$GROQ_KEY" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const o=JSON.parse(s);console.log(o.GROQ_API_KEY||'')}catch(e){console.log('')}}")"
-          else
-            echo "GROQ_ENV_LINE="
-          fi >> /tmp/groq_env_line.txt
-          cat /tmp/groq_env_line.txt | sed 's/GROQ_API_KEY=.*/GROQ_API_KEY=<redacted>/' || true
-
-      - name: Write SSM commands payload to JSON file
-        run: |
-          set -euo pipefail
-          IMAGE_URI="${{ needs.build.outputs.image_uri }}"
-          GROQ_ENV_LINE=$(grep '^GROQ_API_KEY=' /tmp/groq_env_line.txt || true)
-          cat > /tmp/ssm-params.json << SSMPARAMS
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
               "set -euo pipefail",
-              "export AWS_REGION=$AWS_REGION",
+              "export AWS_REGION=ap-south-1",
+              "export ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "export IMAGE_URI=759204735992.dkr.ecr.ap-south-1.amazonaws.com/ai-topology-builder:${{ needs.build.outputs.image_tag }}",
               "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
               "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "printf '%s\\n' '$GROQ_ENV_LINE' 'PORT=$BACKEND_PORT' > /opt/app.env || true",
-              "docker run -d --restart always -p 80:80 --name app --env-file /opt/app.env $IMAGE_URI"
+              "GROQ_KEY=$(aws secretsmanager get-secret-value --secret-id deptic/AI_Topology-Builder/secrets --region ap-south-1 --query SecretString --output text 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"GROQ_API_KEY\",\"\"))' 2>/dev/null || echo '')",
+              "docker run -d --restart always -p 80:80 -e PORT=8000 -e NODE_ENV=production -e GROQ_API_KEY=$GROQ_KEY --name app $IMAGE_URI",
+              "docker ps --filter name=app --format '{{.ID}} {{.Status}}'"
             ]
           }
           SSMPARAMS
-          echo "--- ssm-params.json ---"
+          echo "--- SSM payload written ---"
           cat /tmp/ssm-params.json
 
       - name: Send SSM command to EC2 instance
@@ -168,38 +159,57 @@ jobs:
             case "$STATUS" in
               Success) break ;;
               InProgress|Pending|Delayed) sleep 5 ;;
-              *) echo "SSM command failed with status $STATUS"; aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" || true; exit 1 ;;
+              *) echo "SSM command failed with status: $STATUS"; aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" || true; exit 1 ;;
             esac
           done
-          [ "$STATUS" = "Success" ] || { echo "SSM command did not succeed in time"; exit 1; }
-          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query "StandardOutputContent" --output text || true
+          [ "$STATUS" = "Success" ] || { echo "SSM command did not succeed (last status: $STATUS)"; exit 1; }
+          echo "--- SSM command output ---"
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --query "StandardOutputContent" --output text || true
 
   verify:
-    name: Production Health Verification
-    needs: deploy
+    name: Verify Public Deployment
+    needs: [build, deploy]
     runs-on: ubuntu-latest
     steps:
       - name: Health check public URL (HTTP 200 required)
         run: |
           set -euo pipefail
+          echo "Waiting for deployment to become healthy at $PUBLIC_URL ..."
           CODE="000"
-          for i in $(seq 1 30); do
+          for i in $(seq 1 45); do
             CODE=$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL/" || true)
+            echo "attempt $i: HTTP $CODE"
             [ "$CODE" = "200" ] && break
-            sleep 2
+            sleep 4
           done
-          echo "Public URL $PUBLIC_URL/ returned HTTP $CODE"
-          [ "$CODE" = "200" ] || { echo "Health check failed"; exit 1; }
+          if [ "$CODE" != "200" ]; then
+            echo "FAILURE: expected HTTP 200 from $PUBLIC_URL/ but got HTTP $CODE"
+            exit 1
+          fi
+          echo "SUCCESS: $PUBLIC_URL/ returned HTTP 200"
 
-      - name: Health check backend endpoint via nginx proxy
+      - name: Verify backend API proxy through nginx
         run: |
           set -euo pipefail
-          API_CODE="000"
-          for i in $(seq 1 15); do
-            API_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL/api/raw-topology" || true)
-            [ "$API_CODE" = "200" ] && break
-            sleep 2
-          done
-          echo "Backend $PUBLIC_URL/api/raw-topology returned HTTP $API_CODE"
-          [ "$API_CODE" = "200" ] || { echo "Backend health check failed"; exit 1; }
-          echo "Deployment verified: frontend and backend healthy at $PUBLIC_URL"
+          API_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL/api/raw-topology" || true)
+          echo "GET $PUBLIC_URL/api/raw-topology -> HTTP $API_CODE"
+          if [ "$API_CODE" != "200" ]; then
+            echo "FAILURE: backend API proxy not healthy (HTTP $API_CODE)"
+            exit 1
+          fi
+          curl -s "$PUBLIC_URL/api/raw-topology" | head -c 400
+          echo ""
+          echo "SUCCESS: backend API reachable through nginx proxy on port 80"
+
+      - name: Deployment summary
+        run: |
+          {
+            echo "## AI Topology Builder deployment"
+            echo "- Image: ${{ needs.build.outputs.image_uri }}"
+            echo "- Instance: $INSTANCE_ID (region $AWS_REGION)"
+            echo "- Public URL: $PUBLIC_URL (container port $CONTAINER_PORT, backend port $BACKEND_PORT)"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
